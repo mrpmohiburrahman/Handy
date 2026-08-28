@@ -54,13 +54,24 @@ rubato = "0.16.2"
 hound = "3.5.1"
 log = "0.4.25"
 env_filter = "0.1.0"
-tokio = "1.43.0"
+# `macros` + `sync` back the select!/channel loop in src/gemini_live.rs; the rest
+# of the runtime still comes from tauri::async_runtime.
+tokio = { version = "1.43.0", features = ["macros", "sync", "time"] }
 vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 earshot = "1.2.2"
 enigo = "0.6.1"
 rodio = { git = "https://github.com/cjpais/rodio.git" }
 reqwest = { version = "0.12", features = ["json", "stream", "gzip", "brotli", "deflate"] }
 futures-util = "0.3"
+# Gemini Live API transcription (see src/gemini_live.rs). native-tls reuses the
+# TLS stack reqwest already links rather than pulling in a second one.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+base64 = "0.22"
+# Reads the gitignored .env holding HANDY_GEMINI_KEY (see run() in lib.rs).
+dotenvy = "0.15"
+# Locates that .env for an installed bundle, whose working directory is `/`.
+# Already present transitively via tauri, so this costs no extra build time.
+dirs = "6"
 rustfft = "6.4.0"
 strsim = "0.11.0"
 natural = "0.5.0"

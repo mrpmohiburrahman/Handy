@@ -40,6 +40,11 @@ blob-report/
 .direnv
 .envrc
 
+# Local secrets (HANDY_GEMINI_KEY etc). Never commit; .env.example is the template.
+.env
+.env.*
+!.env.example
+
 # Nix build output
 result
 

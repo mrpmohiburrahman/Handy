@@ -74,6 +74,18 @@ pub fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, tauri::Error> {
     }
 }
 
+/// App data dir resolved before Tauri exists, so startup code that runs ahead
+/// of the builder can find user files. Mirrors `app_data_dir` above: portable
+/// mode wins, otherwise the platform data dir joined with the bundle
+/// identifier. Keep IDENTIFIER in step with `identifier` in tauri.conf.json.
+pub fn app_data_dir_early() -> Option<PathBuf> {
+    const IDENTIFIER: &str = "com.pais.handy";
+    if let Some(dir) = data_dir() {
+        return Some(dir.clone());
+    }
+    dirs::data_dir().map(|dir| dir.join(IDENTIFIER))
+}
+
 /// Portable-aware replacement for `app.path().app_log_dir()`.
 pub fn app_log_dir(app: &tauri::AppHandle) -> Result<PathBuf, tauri::Error> {
     if let Some(dir) = data_dir() {

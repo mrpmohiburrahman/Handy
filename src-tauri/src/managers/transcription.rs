@@ -822,6 +822,70 @@ impl TranscriptionManager {
         thread::spawn(move || manager.run_stream_worker(rx, worker_id));
     }
 
+    /// Run a live streaming session against the Gemini Live API, driving the
+    /// same overlay events and finalize handshake as the local engine path.
+    ///
+    /// The local engine is never leased here, so a failure at any point just
+    /// drains the channel: the caller completes its handshake and falls back to
+    /// batch transcription exactly as it would for a non-streaming model.
+    fn run_gemini_stream(&self, rx: mpsc::Receiver<StreamCmd>, api_key: String) {
+        let manager = self.clone();
+        let connected =
+            crate::gemini_live::GeminiSession::connect(api_key, move |committed, tentative| {
+                manager.emit_stream_text(&committed, &tentative);
+            });
+        let session = match connected {
+            Ok(session) => session,
+            Err(e) => {
+                error!(
+                    "Gemini Live unavailable ({}); falling back to batch transcription",
+                    e
+                );
+                self.router.clear();
+                drain_until_finalize(rx);
+                return;
+            }
+        };
+
+        self.stream_active.store(true, Ordering::Release);
+        self.touch_activity();
+        info!("Live streaming transcription started (Gemini Live API)");
+
+        while let Ok(cmd) = rx.recv() {
+            match cmd {
+                StreamCmd::Feed(pcm) => {
+                    self.touch_activity();
+                    session.feed(&pcm);
+                }
+                StreamCmd::Finalize(reply) => {
+                    let result = match session.finalize() {
+                        Ok(text) => Some(FinalizedStreamText {
+                            text,
+                            // Gemini auto-detects the spoken language and does not
+                            // report it back, so language-gated post-processing
+                            // stays on its unknown-language path.
+                            output_language: OutputLanguageEvidence::Unknown,
+                            supported_languages: Vec::new(),
+                        }),
+                        Err(e) => {
+                            error!(
+                                "Gemini Live finalize failed: {}; falling back to batch transcription",
+                                e
+                            );
+                            None
+                        }
+                    };
+                    let _ = reply.send(result);
+                    return;
+                }
+                StreamCmd::Cancel => {
+                    session.cancel();
+                    return;
+                }
+            }
+        }
+    }
+
     fn run_stream_worker(&self, rx: mpsc::Receiver<StreamCmd>, worker_id: u64) {
         let _worker = StreamWorkerGuard {
             worker_id,
@@ -829,6 +893,15 @@ impl TranscriptionManager {
             active_engine_lease: Arc::clone(&self.active_engine_lease),
             stream_active: Arc::clone(&self.stream_active),
         };
+
+        // ponytail: spike. With HANDY_GEMINI_KEY set, live transcription runs
+        // against the Gemini Live API instead of the local engine. Checked ahead
+        // of the model-load wait below because the Gemini path never touches the
+        // local engine, so there is nothing to wait for.
+        if let Some(api_key) = crate::gemini_live::api_key() {
+            self.run_gemini_stream(rx, api_key);
+            return;
+        }
 
         // Wait for any in-progress model load to finish (start_stream races the
         // background load kicked off when recording starts).

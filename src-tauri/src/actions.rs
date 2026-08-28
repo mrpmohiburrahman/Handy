@@ -476,7 +476,13 @@ impl ShortcutAction for TranscribeAction {
 
         // Load ASR model and VAD model in parallel
         let kickoff_started = Instant::now();
-        tm.initiate_model_load();
+        // ponytail: spike. Gemini transcribes server-side, so warming a local
+        // engine is wasted work — and with no model downloaded at all it fails
+        // the load and emits a `loading_failed` toast on every single keypress.
+        // VAD still preloads below; the streaming policy needs it either way.
+        if crate::gemini_live::api_key().is_none() {
+            tm.initiate_model_load();
+        }
         let rm_clone = Arc::clone(&rm);
         std::thread::spawn(move || {
             if let Err(e) = rm_clone.preload_vad() {
@@ -502,10 +508,15 @@ impl ShortcutAction for TranscribeAction {
         // Use the app-facing model capability as the single pre-recording source
         // for live streaming decisions. Unknown support is represented as false
         // until the model registry is updated by discovery or runtime load.
-        let model_supports_streaming = selected_model_info
-            .as_ref()
-            .map(|m| m.supports_streaming)
-            .unwrap_or(false);
+        // ponytail: spike. The Gemini Live backend streams regardless of what the
+        // locally selected model can do, so this gate — which drives start_stream,
+        // the VAD policy and the overlay form alike — has to reflect the backend
+        // that will actually run, not just the local one.
+        let model_supports_streaming = crate::gemini_live::api_key().is_some()
+            || selected_model_info
+                .as_ref()
+                .map(|m| m.supports_streaming)
+                .unwrap_or(false);
         let vad_policy = if !settings.vad_enabled {
             VadPolicy::Disabled
         } else if model_supports_streaming {
@@ -724,6 +735,12 @@ impl ShortcutAction for TranscribeAction {
                         // surfaced instead — the worker may still hold the engine,
                         // so a batch fallback would contend with it.
                         Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
+                        // ponytail: spike. Gemini owns this run, so there is no
+                        // local engine to fall back to — with no model downloaded
+                        // at all, batch would raise "Model is not loaded for
+                        // transcription" and surface a misleading error toast for
+                        // what is really just silence or a cancelled recording.
+                        Ok(_) if crate::gemini_live::api_key().is_some() => Ok(String::new()),
                         Ok(_) => tm.transcribe(samples),
                         Err(err) => Err(err),
                     };
