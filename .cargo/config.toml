@@ -1,1 +1,8 @@
 [build]
+
+[net]
+# Handy pins git forks (tao, rdev, rodio, hf-hub) by https URL. A global
+# `url.git@github.com:.insteadOf https://github.com/` rewrite turns those into
+# SSH, which cargo's built-in git client cannot authenticate. Shelling out to the
+# git CLI honours the rewrite and the user's SSH keys, so the fetch succeeds.
+git-fetch-with-cli = true
