@@ -818,7 +818,23 @@ fn run_consumer(
         if let Some(cfg) = vad {
             let mut det = cfg.detector.lock().unwrap();
             match det.push_frame(samples).unwrap_or(VadFrame::Speech(samples)) {
-                VadFrame::Speech(buf) => emit(buf),
+                VadFrame::Speech(buf) => {
+                    // ponytail: benchmark metric 2 anchor (ticket 06). On onset
+                    // the smoothed VAD flushes its prefill ring, so `buf` holds
+                    // already-past audio; subtracting it estimates the true
+                    // acoustic onset rather than the confirmation instant.
+                    if let Some(d) = crate::perf::first_voice() {
+                        let prefill_ms = buf.len().saturating_sub(samples.len()) as f64 * 1000.0
+                            / constants::WHISPER_SAMPLE_RATE as f64;
+                        log::info!(
+                            "perf: hotkey -> speech onset = {:.1}ms (VAD confirmed {:.1}ms, prefill {:.1}ms)",
+                            crate::perf::ms(d) - prefill_ms,
+                            crate::perf::ms(d),
+                            prefill_ms
+                        );
+                    }
+                    emit(buf)
+                }
                 VadFrame::Noise => {}
             }
         } else {
@@ -1015,6 +1031,13 @@ fn run_consumer(
                     chunk_ms,
                     started.elapsed()
                 );
+                // ponytail: benchmark metric 1 (ticket 06).
+                if let Some(d) = crate::perf::first_pcm() {
+                    log::info!(
+                        "perf: hotkey -> first PCM in hand = {:.1}ms",
+                        crate::perf::ms(d)
+                    );
+                }
             }
             if let Some(ready_tx) = capture_ready_tx.take() {
                 // Signal only after this chunk has passed through the visualizer

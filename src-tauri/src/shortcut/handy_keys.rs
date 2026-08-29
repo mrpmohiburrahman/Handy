@@ -127,11 +127,19 @@ impl HandyKeysState {
             // Check for hotkey events (non-blocking)
             while let Some(event) = manager.try_recv() {
                 if let Some((binding_id, hotkey_string)) = hotkey_to_binding.get(&event.id) {
+                    let is_pressed = event.state == HotkeyState::Pressed;
+                    // ponytail: benchmark anchor (ticket 06). Earliest sighting
+                    // in this crate; see perf.rs for the 0-10ms poll prefix that
+                    // sits in front of it and cannot be measured from here.
+                    if is_pressed
+                        && crate::transcription_coordinator::is_transcribe_binding(binding_id)
+                    {
+                        crate::perf::mark_hotkey();
+                    }
                     debug!(
                         "handy-keys event: binding={}, hotkey={}, state={:?}",
                         binding_id, hotkey_string, event.state
                     );
-                    let is_pressed = event.state == HotkeyState::Pressed;
                     handle_shortcut_event(&app, binding_id, hotkey_string, is_pressed);
                 }
             }

@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -17,6 +18,28 @@ type OverlayState = "recording" | "streaming" | "transcribing" | "processing";
 // Number of reactive bars in the waveform (the simple, smoothed style shared by
 // every overlay form). Mic levels arrive as 16 FFT buckets; we take the first N.
 const WAVE_BARS = 9;
+
+// ponytail: benchmark instrument for
+// `.scratch/rn-macos-rewrite/issues/06-baseline-benchmark.md`, not product code.
+// Rust can only measure up to the moment it emits; the IPC hop and the React
+// render are only visible from here. `Date.now()` is the one clock both sides
+// share (`Instant` cannot cross IPC), so the hop is a difference of wall
+// stamps; the render leg uses `performance.now()` entirely within this frame.
+let perfTextSeen = false;
+let perfRecvWall = 0;
+let perfRecvPerf = 0;
+
+const perfResetSession = () => {
+  perfTextSeen = false;
+};
+
+// Writes into the Rust log so every leg of the measurement lands in one
+// correlatable file. `plugin:log|log` is tauri-plugin-log's own command — no JS
+// package needed, just the `log:default` capability.
+const perfLog = (message: string) => {
+  console.log(message);
+  void invoke("plugin:log|log", { level: 3, message }).catch(() => {});
+};
 
 const RecordingOverlay: React.FC = () => {
   const { t } = useTranslation();
@@ -64,6 +87,7 @@ const RecordingOverlay: React.FC = () => {
           smoothedLevelsRef.current = Array(16).fill(0);
           setLevels(Array(WAVE_BARS).fill(0));
           setStreamText({ committed: "", tentative: "" });
+          perfResetSession();
         }
 
         await syncLanguageFromSettings();
@@ -112,6 +136,13 @@ const RecordingOverlay: React.FC = () => {
       });
 
       const unlistenStream = await events.streamTextEvent.listen((event) => {
+        if (
+          !perfTextSeen &&
+          (event.payload.committed || event.payload.tentative)
+        ) {
+          perfRecvWall = Date.now();
+          perfRecvPerf = performance.now();
+        }
         setStreamText(event.payload);
       });
 
@@ -144,6 +175,22 @@ const RecordingOverlay: React.FC = () => {
   // Stick to the bottom as text streams in — but only while pinned, so a user who
   // has scrolled up to read history isn't yanked back down by the next chunk.
   useLayoutEffect(() => {
+    // ponytail: benchmark metric 2, frontend leg (ticket 06). useLayoutEffect
+    // fires after React commits the DOM mutation and before paint; the rAF
+    // callback then fires after the paint that included the text.
+    if (!perfTextSeen && (streamText.committed || streamText.tentative)) {
+      perfTextSeen = true;
+      const domAt = performance.now();
+      requestAnimationFrame(() => {
+        const paintedAt = performance.now();
+        perfLog(
+          `perf: overlay first word: recv_wall=${perfRecvWall.toFixed(0)} ` +
+            `react=${(domAt - perfRecvPerf).toFixed(1)}ms ` +
+            `paint=${(paintedAt - domAt).toFixed(1)}ms`,
+        );
+      });
+    }
+
     const el = capRef.current;
     if (!el) return;
     // Fade the top edge only once text actually overflows the cap.

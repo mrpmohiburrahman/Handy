@@ -1229,11 +1229,28 @@ impl TranscriptionManager {
     }
 
     fn emit_stream_text(&self, committed: &str, tentative: &str) {
+        // ponytail: benchmark metric 2 (ticket 06). Stamped before the emit so
+        // the wall clock matches the moment the payload leaves Rust, logged
+        // after it so the log write stays outside the measured span.
+        let stamp = if committed.is_empty() && tentative.is_empty() {
+            None
+        } else {
+            crate::perf::first_text().map(|d| (d, crate::perf::wall_ms()))
+        };
+
         let _ = StreamTextEvent {
             committed: committed.to_string(),
             tentative: tentative.to_string(),
         }
         .emit(&self.app_handle);
+
+        if let Some((d, wall)) = stamp {
+            log::info!(
+                "perf: hotkey -> first word emitted = {:.1}ms (wall {:.1})",
+                crate::perf::ms(d),
+                wall
+            );
+        }
     }
 
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {

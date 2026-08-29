@@ -5,6 +5,10 @@ use clap::Parser;
 use handy_app_lib::CliArgs;
 
 fn main() {
+    // ponytail: benchmark anchor (ticket 06) — first statement, so the
+    // cold-launch number includes argument parsing and plugin setup.
+    handy_app_lib::perf::mark_process_start();
+
     let cli_args = CliArgs::parse();
 
     #[cfg(target_os = "linux")]

@@ -108,6 +108,15 @@ pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<()
             if scut == &shortcut {
                 let shortcut_string = scut.into_string();
                 let is_pressed = event.state == ShortcutState::Pressed;
+                // ponytail: benchmark anchor (ticket 06), mirroring handy_keys.rs
+                // so a Secure Input fallback cannot leave the anchor stale.
+                if is_pressed
+                    && crate::transcription_coordinator::is_transcribe_binding(
+                        &binding_id_for_closure,
+                    )
+                {
+                    crate::perf::mark_hotkey();
+                }
                 // Mirrors the handy-keys event log line; the distinct prefix
                 // makes it possible to tell which backend fired a shortcut
                 // (e.g. when diagnosing the Secure Input fallback)

@@ -32,7 +32,11 @@ pub fn handle_shortcut_event(
     hotkey_string: &str,
     is_pressed: bool,
 ) {
+    // ponytail: benchmark span (ticket 06). This full settings deserialize sits
+    // on the keypress path and runs again inside TranscribeAction::start.
+    let settings_started = std::time::Instant::now();
     let settings = get_settings(app);
+    let settings_elapsed = settings_started.elapsed();
 
     // Transcribe bindings are handled by the coordinator.
     if is_transcribe_binding(binding_id) {
@@ -41,6 +45,12 @@ pub fn handle_shortcut_event(
         } else {
             warn!("TranscriptionCoordinator is not initialized");
         }
+        // Logged after the send so it cannot inflate the span it reports.
+        log::debug!(
+            "perf: shortcut->coordinator handoff: settings_load={:?} since_hotkey={:?}",
+            settings_elapsed,
+            crate::perf::since_hotkey()
+        );
         return;
     }
 

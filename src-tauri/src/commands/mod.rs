@@ -179,6 +179,16 @@ pub fn initialize_shortcuts(app: AppHandle) -> Result<(), String> {
     // Initialize shortcuts
     crate::shortcut::init_shortcuts(&app);
 
+    // ponytail: benchmark metric 3 (ticket 06). Shortcuts are registered from
+    // the frontend, so this is the first instant a key press can do anything —
+    // it includes webview boot, not just Rust setup.
+    if let Some(d) = crate::perf::since_process_start() {
+        log::info!(
+            "perf: process start -> hotkey-responsive = {:.1}ms",
+            crate::perf::ms(d)
+        );
+    }
+
     // Mark as initialized before reconciling the macOS Secure Input fallback.
     app.manage(ShortcutsInitialized);
     crate::secure_input::reconcile_fallback(&app);
