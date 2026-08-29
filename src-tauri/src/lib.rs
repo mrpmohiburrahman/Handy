@@ -16,6 +16,7 @@ mod managers;
 mod memory;
 mod overlay;
 mod paste_tx;
+pub mod perf;
 pub mod portable;
 mod secure_input;
 mod settings;
@@ -592,15 +593,11 @@ pub fn run(cli_args: CliArgs) {
     // Load `.env` before anything reads the environment, so every HANDY_* knob
     // below (and HANDY_GEMINI_KEY in gemini_live) can live in a gitignored file
     // instead of the shell. Real environment variables always win, so an
-    // explicit `FOO=bar handy` still overrides the file. Resolved by walking up
-    // from the working directory, which covers `.env` at the repo root or in
-    // src-tauri/ under `tauri dev`.
-    match dotenvy::dotenv() {
-        Ok(path) => eprintln!("[env] loaded {}", path.display()),
-        // Absent .env is the normal case for an installed build, not an error.
-        Err(e) if e.not_found() => {}
-        Err(e) => eprintln!("[env] could not read .env: {}", e),
-    }
+    // explicit `FOO=bar handy` still overrides the file. `ensure_env_loaded`
+    // searches the working directory, the executable's ancestry, and the
+    // portable / app-data directory, so the key is honored whether launched via
+    // `tauri dev`, from the tray, or as an installed bundle.
+    crate::gemini_live::ensure_env_loaded();
 
     // Avoid ggml-metal residency-set teardown assertions when a native engine
     // outlives the Tauri shutdown sequence (#1902). This must happen before
@@ -622,19 +619,6 @@ pub fn run(cli_args: CliArgs) {
 
     // Detect portable mode before anything else
     portable::init();
-
-    // The walk above starts at the working directory, which is `/` for a bundle
-    // launched from Finder or the tray — so an installed build never sees the
-    // repo's .env. Look again in the app data directory, the one location that
-    // is stable across reinstalls and outside the signed bundle. dotenvy keeps
-    // the first value it sees, so the shell and the repo .env still win.
-    if let Some(env_path) = portable::app_data_dir_early().map(|dir| dir.join(".env")) {
-        match dotenvy::from_path(&env_path) {
-            Ok(()) => eprintln!("[env] loaded {}", env_path.display()),
-            Err(e) if e.not_found() => {}
-            Err(e) => eprintln!("[env] could not read {}: {}", env_path.display(), e),
-        }
-    }
 
     // Parse console logging directives from RUST_LOG, falling back to info-level logging
     // when the variable is unset

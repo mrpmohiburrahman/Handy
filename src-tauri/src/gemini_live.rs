@@ -22,6 +22,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use serde_json::{json, Value};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -53,11 +54,60 @@ const FLUSH_GRACE: Duration = Duration::from_millis(600);
 /// The API key for the spike, or `None` to leave the local engine in charge.
 /// Presence of a key is what switches Handy over to Gemini.
 pub fn api_key() -> Option<String> {
+    ensure_env_loaded();
     ["HANDY_GEMINI_KEY", "GEMINI_API_KEY"]
         .iter()
         .find_map(|name| std::env::var(name).ok())
-        .map(|key| key.trim().to_string())
+        .map(|key| key.trim().trim_matches('"').to_string())
         .filter(|key| !key.is_empty())
+}
+
+/// Make every `HANDY_*` knob written in a `.env` file visible to the process,
+/// no matter how the app was launched. Called once; later calls are no-ops.
+///
+/// A repo-root `.env` is found in three situations that all differ by working
+/// directory, so we try each candidate location in turn:
+///
+/// 1. Walk up from the current working directory — covers `tauri dev`, where
+///    the CWD is the project root.
+/// 2. Walk up from the executable — covers a bundle (`Handy.app`) launched from
+///    Finder or the tray, whose CWD is `/` and therefore never reaches the repo.
+///    The executable still lives under the repo, so the walk finds the same
+///    `.env`.
+/// 3. The portable / app-data directory — covers installed and portable builds
+///    that keep their config outside the signed bundle.
+///
+/// `dotenvy` keeps the first value it sees, so an explicit environment variable
+/// always wins over a file.
+pub(crate) fn ensure_env_loaded() {
+    static LOADED: OnceLock<bool> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        if let Ok(path) = dotenvy::dotenv() {
+            eprintln!("[env] loaded {}", path.display());
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            for dir in exe.ancestors().skip(1) {
+                let candidate = dir.join(".env");
+                if candidate.is_file() {
+                    match dotenvy::from_path(&candidate) {
+                        Ok(()) => eprintln!("[env] loaded {}", candidate.display()),
+                        Err(e) => eprintln!("[env] could not read {}: {}", candidate.display(), e),
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(env_path) = crate::portable::app_data_dir_early().map(|dir| dir.join(".env")) {
+            match dotenvy::from_path(&env_path) {
+                Ok(()) => eprintln!("[env] loaded {}", env_path.display()),
+                Err(e) if !e.not_found() => {
+                    eprintln!("[env] could not read {}: {}", env_path.display(), e)
+                }
+                Err(_) => {}
+            }
+        }
+        true
+    });
 }
 
 /// Commands sent to the async socket task.
@@ -682,7 +732,10 @@ mod tests {
         let finalize_started = std::time::Instant::now();
         let text = session.finalize().expect("finalize");
         let finalize_took = finalize_started.elapsed();
-        println!("FINAL TRANSCRIPT: {} (finalize took {:?})", text, finalize_took);
+        println!(
+            "FINAL TRANSCRIPT: {} (finalize took {:?})",
+            text, finalize_took
+        );
 
         // Guards the regression this test previously passed straight through:
         // the transcript was correct, but only because `finalize` sat out the
