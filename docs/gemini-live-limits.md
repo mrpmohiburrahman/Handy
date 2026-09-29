@@ -76,6 +76,38 @@ The trade-off is a fresh TLS + setup handshake per dictation, measured at
 one long-lived session would need compression and resumption, and this section
 stops being academic.
 
+## Restricting the transcription language
+
+`inputAudioTranscription.languageCodes` is the only language control this model
+exposes, and it is a **bias, not a filter**. Setting `["bn-BD", "en-US"]` does
+not stop the model transcribing other languages.
+
+Measured 2026-09-28, one Hindi utterance fed as 16 kHz PCM (`say -v Lekha`):
+
+| `languageCodes` | Transcript |
+| --- | --- |
+| `[]` (auto-detect) | `मेरा नाम लेखा है और मैं हिंदी बोलती हूं।` |
+| `["bn-BD", "en-US"]` | `मेरा नाम लेखा है और मैं हिंदी बोलती हूं।` |
+
+Byte-identical: the codes changed nothing, and the third language came back in
+its own script rather than being folded into Bangla or English. The docs list
+`systemInstruction` as a Live *Agent* feature, not a transcription one, so there
+is no prompt-side workaround either.
+
+An allowlist therefore has to be enforced client-side.
+[`gemini_live.rs`](../src-tauri/src/gemini_live.rs) does exactly that in
+`accepts_transcript`, which the Gemini finalize path runs before returning text:
+a script check rejects any letter outside Latin or Bengali (Devanagari, Tamil,
+CJK, …), then `whatlang` — via
+[`audio_toolkit/lang_id.rs`](../src-tauri/src/audio_toolkit/lang_id.rs) — rejects
+Latin-script languages it can name confidently, such as French. It fails open,
+so only a confident foreign detection drops the text and romanized Bangla
+survives the detector's `None`.
+
+The gaps are the parts neither check can see: Assamese shares Bengali script,
+and a Latin-script third language the detector declines (Indonesian probes as
+`None`) passes through.
+
 ## Data handling: the real free-vs-paid difference
 
 Google's API terms treat the two tiers very differently, and for dictation this

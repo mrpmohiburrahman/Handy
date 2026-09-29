@@ -859,14 +859,29 @@ impl TranscriptionManager {
                 }
                 StreamCmd::Finalize(reply) => {
                     let result = match session.finalize() {
-                        Ok(text) => Some(FinalizedStreamText {
-                            text,
-                            // Gemini auto-detects the spoken language and does not
-                            // report it back, so language-gated post-processing
-                            // stays on its unknown-language path.
-                            output_language: OutputLanguageEvidence::Unknown,
-                            supported_languages: Vec::new(),
-                        }),
+                        Ok(text) => {
+                            // The model transcribes whatever it hears, so the
+                            // Bangla/English allowlist is enforced here. Empty
+                            // text emits nothing and does not reach the batch
+                            // fallback (see the Gemini spike arm in actions.rs).
+                            let text = if crate::gemini_live::accepts_transcript(&text) {
+                                text
+                            } else {
+                                info!(
+                                    "Gemini Live transcript dropped: detected language is \
+                                     neither Bangla nor English"
+                                );
+                                String::new()
+                            };
+                            Some(FinalizedStreamText {
+                                text,
+                                // Gemini auto-detects the spoken language and does not
+                                // report it back, so language-gated post-processing
+                                // stays on its unknown-language path.
+                                output_language: OutputLanguageEvidence::Unknown,
+                                supported_languages: Vec::new(),
+                            })
+                        }
                         Err(e) => {
                             error!(
                                 "Gemini Live finalize failed: {}; falling back to batch transcription",

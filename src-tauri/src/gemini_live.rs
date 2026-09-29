@@ -32,6 +32,52 @@ const MODEL: &str = "models/gemini-3.5-transcribe-live";
 const WS_HOST: &str = "wss://generativelanguage.googleapis.com/ws/\
                        google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
+/// Recognition is *biased* toward these languages, not restricted to them. The
+/// transcribe-live model has no allowlist mode, and a third language spoken
+/// clearly still transcribes in its own script (probing Hindi returns
+/// Devanagari whether these codes are set or the list is left empty).
+const LANGUAGE_CODES: [&str; 2] = ["bn-BD", "en-US"];
+
+/// ISO 639-1 form of [`LANGUAGE_CODES`], for gating the returned transcript.
+const ACCEPTED_LANGUAGES: [&str; 2] = ["bn", "en"];
+
+/// Letters that can only belong to a language we did not ask for. Bangla is
+/// Bengali script and English is Latin, so any other alphabet — Devanagari,
+/// Tamil, Cyrillic, CJK — is decisive on its own and needs no detector.
+/// Romanized Bangla and Hindi stay Latin and fall through to the detector.
+fn is_foreign_script(c: char) -> bool {
+    c.is_alphabetic() && !is_wanted_script(c)
+}
+
+fn is_wanted_script(c: char) -> bool {
+    c.is_ascii()
+        || ('\u{00C0}'..='\u{024F}').contains(&c) // Latin-1 Supplement + Extended A/B
+        || ('\u{1E00}'..='\u{1EFF}').contains(&c) // Latin Extended Additional
+        || ('\u{0980}'..='\u{09FF}').contains(&c) // Bengali
+}
+
+/// Whether a finalized transcript plausibly belongs to a language we asked for.
+///
+/// The model transcribes whatever it hears, so the allowlist the API refuses to
+/// enforce is applied here instead. Script is checked first because it is
+/// decisive: probing the live model with Hindi returns Devanagari, and the
+/// detector alone answers `None` for Devanagari (it cannot separate Hindi from
+/// Marathi) which would let the text through. The detector then catches
+/// Latin-script languages it is confident about, e.g. French.
+///
+/// Fails open — only a confident detection of some *other* language rejects the
+/// text, so romanized Bangla and short or ambiguous utterances are never
+/// silently dropped.
+pub fn accepts_transcript(text: &str) -> bool {
+    if text.chars().any(is_foreign_script) {
+        return false;
+    }
+    match crate::audio_toolkit::lang_id::detect_output_language(text, &[]) {
+        Some(language) => ACCEPTED_LANGUAGES.contains(&language.as_str()),
+        None => true,
+    }
+}
+
 /// Gemini wants ~100 ms per chunk (1,024-2,048 frames at 16 kHz). The audio
 /// recorder hands us much smaller frames, so `feed` coalesces them to this size
 /// before anything goes over the socket.
@@ -306,8 +352,8 @@ async fn run_socket(
         "setup": {
             "model": MODEL,
             "generationConfig": { "responseModalities": ["TEXT"] },
-            // Empty language list = automatic language detection.
-            "inputAudioTranscription": { "languageCodes": [] }
+            // Bias (not restrict) recognition toward Bangla and English.
+            "inputAudioTranscription": { "languageCodes": LANGUAGE_CODES }
         }
     });
     if let Err(e) = write.send(Message::text(setup.to_string())).await {
@@ -684,6 +730,45 @@ mod tests {
         // model sends them in their own frame.
         assert!(!has_transcription(&json!({ "generationComplete": true })));
         assert!(!has_transcription(&json!({})));
+    }
+
+    #[test]
+    fn transcripts_in_the_wanted_languages_are_kept() {
+        assert!(accepts_transcript(
+            "First sentence about apples and second sentence about oranges."
+        ));
+        assert!(accepts_transcript("আমার নাম লিখা এবং আমি বাংলা বলি।"));
+    }
+
+    #[test]
+    fn foreign_scripts_are_rejected() {
+        // The exact line the live Hindi probe returned.
+        assert!(
+            !accepts_transcript("मेरा नाम लेखा है और मैं हिंदी बोलती हूं।"),
+            "Devanagari must be rejected"
+        );
+        assert!(!accepts_transcript("இது ஒரு தமிழ் வாக்கியம்"));
+        assert!(!accepts_transcript("这是一个完全用中文写成的句子"));
+    }
+
+    #[test]
+    fn detected_foreign_latin_languages_are_rejected() {
+        assert!(!accepts_transcript(
+            "je m'appelle likha et je parle francais tous les jours"
+        ));
+    }
+
+    #[test]
+    fn ambiguous_transcripts_fail_open() {
+        // Too short for a confident detection, so it is kept rather than
+        // silently swallowing a real dictation.
+        assert!(accepts_transcript("ok"));
+        assert!(accepts_transcript(""));
+        // Romanized Bangla is Latin-script and the detector declines it, which
+        // must not cost the user their sentence.
+        assert!(accepts_transcript(
+            "amar nam likha hai ebong ami bangla boli"
+        ));
     }
 
     /// Full round trip through `GeminiSession` against the live endpoint, using
