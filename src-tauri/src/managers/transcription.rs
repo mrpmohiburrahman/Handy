@@ -1109,7 +1109,7 @@ impl TranscriptionManager {
         // live result with `decode_batch`, which can only fail with no model,
         // so an empty result from this path stays empty instead.
         let gemini_empty = crate::gemini_live::api_key().is_some()
-            && live.as_ref().map_or(true, |outcome| outcome.text.is_empty());
+            && live.as_ref().is_none_or(|outcome| outcome.text.is_empty());
         if gemini_empty {
             self.maybe_unload_immediately("gemini live");
             return Ok(Transcription {
