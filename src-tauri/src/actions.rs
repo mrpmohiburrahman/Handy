@@ -239,6 +239,16 @@ enum PostProcessOutcome {
     Failed,
 }
 
+/// Whether dictation must wait for a local model before it opens the mic.
+///
+/// The Gemini backend transcribes server-side, so it needs neither a
+/// downloaded model nor a loaded engine. Blocking it on a local model would
+/// raise "No Model Selected" on every keypress for a user who runs Gemini
+/// only.
+fn needs_local_model(gemini_live: bool, model_loaded: bool) -> bool {
+    !gemini_live && !model_loaded
+}
+
 async fn post_process_transcription(
     settings: &AppSettings,
     transcription: &str,
@@ -566,7 +576,15 @@ impl ShortcutAction for TranscribeAction {
 
         // Don't open the mic if nothing can transcribe the recording. A load
         // started above reports its own failure; one already running doesn't.
-        if !tm.is_model_loaded() {
+        //
+        // The Gemini path is exempt: it transcribes server-side, so it needs
+        // neither a loaded engine nor a selected local model. Blocking it here
+        // would raise "No Model Selected" on every keypress for a user who
+        // never downloads a local model.
+        if needs_local_model(
+            crate::gemini_live::api_key().is_some(),
+            tm.is_model_loaded(),
+        ) {
             if selected_model.is_empty() {
                 warn!("Not starting recording: no model is selected");
                 tm.raise_no_model_selected();
@@ -1140,9 +1158,9 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, non_blank_post_processed_text,
-        post_process_transcription, select_vad_policy, should_use_streaming_overlay,
-        strip_invisible_chars, strip_think_block, PostProcessOutcome,
+        complete_unless_cancelled, is_blank_transcription, needs_local_model,
+        non_blank_post_processed_text, post_process_transcription, select_vad_policy,
+        should_use_streaming_overlay, strip_invisible_chars, strip_think_block, PostProcessOutcome,
     };
     use crate::audio_toolkit::VadPolicy;
     use crate::settings::{get_default_settings, AppSettings, OverlayStyle};
@@ -1243,6 +1261,20 @@ mod tests {
         assert_eq!(select_vad_policy(true, false, false), VadPolicy::Offline);
         assert_eq!(select_vad_policy(false, false, true), VadPolicy::Disabled);
         assert_eq!(select_vad_policy(false, false, false), VadPolicy::Disabled);
+    }
+
+    #[test]
+    fn gemini_dictation_never_waits_for_a_local_model() {
+        // Gemini transcribes server-side. A user with no model downloaded
+        // must still reach the mic instead of reading "No Model Selected".
+        assert!(!needs_local_model(true, false));
+        assert!(!needs_local_model(true, true));
+    }
+
+    #[test]
+    fn local_dictation_waits_for_a_loaded_model() {
+        assert!(needs_local_model(false, false));
+        assert!(!needs_local_model(false, true));
     }
 
     #[test]
