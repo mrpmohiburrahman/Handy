@@ -861,18 +861,13 @@ impl TranscriptionManager {
                     let result = match session.finalize() {
                         Ok(text) => {
                             // The model transcribes whatever it hears, so the
-                            // Bangla/English allowlist is enforced here. Empty
-                            // text emits nothing and does not reach the batch
-                            // fallback (see the Gemini spike arm in actions.rs).
-                            let text = if crate::gemini_live::accepts_transcript(&text) {
-                                text
-                            } else {
-                                info!(
-                                    "Gemini Live transcript dropped: detected language is \
-                                     neither Bangla nor English"
-                                );
-                                String::new()
-                            };
+                            // Bangla/English allowlist is enforced here: words
+                            // in another script are removed, and text that is
+                            // confidently another language comes back empty.
+                            // Empty text emits nothing and does not reach the
+                            // batch fallback (see the Gemini spike arm in
+                            // actions.rs).
+                            let text = crate::gemini_live::filter_transcript(&text);
                             Some(FinalizedStreamText {
                                 text,
                                 // Gemini auto-detects the spoken language and does not

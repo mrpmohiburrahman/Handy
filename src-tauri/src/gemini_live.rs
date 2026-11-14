@@ -11,10 +11,12 @@
 //! (`feed` / `finalize` / `cancel`) so the streaming worker treats both
 //! backends the same way.
 //!
-//! ponytail: spike. The API key comes from the environment, the model and
-//! language are fixed, and a mid-session network failure ends the run with
-//! whatever text arrived rather than falling back to the local engine. Promote
-//! to a settings field + model-picker entry if this proves out.
+//! ponytail: spike. The API key, transcription mode and custom vocabulary come
+//! from the environment (`HANDY_GEMINI_KEY`, `HANDY_GEMINI_MODE`,
+//! `HANDY_GEMINI_VOCABULARY`), the model is fixed, and a mid-session network
+//! failure ends the run with whatever text arrived rather than falling back to
+//! the local engine. Promote to settings fields + a model-picker entry if this
+//! proves out.
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -32,14 +34,103 @@ const MODEL: &str = "models/gemini-3.5-transcribe-live";
 const WS_HOST: &str = "wss://generativelanguage.googleapis.com/ws/\
                        google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
-/// Recognition is *biased* toward these languages, not restricted to them. The
-/// transcribe-live model has no allowlist mode, and a third language spoken
-/// clearly still transcribes in its own script (probing Hindi returns
-/// Devanagari whether these codes are set or the list is left empty).
-const LANGUAGE_CODES: [&str; 2] = ["bn-BD", "en-US"];
+/// Language hints sent to the model. Empty means automatic detection, which is
+/// what Google documents for multilingual speech and code-switching. A hint
+/// only *biases* recognition and cannot restrict it (probing Hindi returns
+/// Devanagari with or without `["bn-BD", "en-US"]`), so pinning two languages
+/// bought no filtering and risked steering mixed Bangla/English sentences.
+/// The allowlist is enforced on the returned text instead — see
+/// [`filter_transcript`].
+const LANGUAGE_CODES: [&str; 0] = [];
 
-/// ISO 639-1 form of [`LANGUAGE_CODES`], for gating the returned transcript.
+/// ISO 639-1 codes of the languages a returned transcript may be in.
 const ACCEPTED_LANGUAGES: [&str; 2] = ["bn", "en"];
+
+/// Environment variable selecting the transcription mode (`SMART` or
+/// `VERBATIM`).
+const MODE_ENV: &str = "HANDY_GEMINI_MODE";
+
+/// Environment variable holding comma- or newline-separated terms to bias
+/// recognition toward (names, brands, jargon).
+const VOCABULARY_ENV: &str = "HANDY_GEMINI_VOCABULARY";
+
+/// The API accepts at most this many custom vocabulary terms.
+const MAX_VOCABULARY_TERMS: usize = 1000;
+
+/// How the model words the finalized transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptionMode {
+    /// Literal transcript: filler words, repetitions and false starts are kept.
+    Verbatim,
+    /// Cleaned for reading: fillers and false starts removed, spoken
+    /// corrections resolved, punctuation and casing applied.
+    Smart,
+}
+
+impl TranscriptionMode {
+    /// Dictation is pasted straight into other apps, so the cleaned-up form is
+    /// the default; anything unrecognised falls back to it rather than failing.
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_uppercase()).as_deref() {
+            Some("VERBATIM") => Self::Verbatim,
+            Some("SMART") | Some("") | None => Self::Smart,
+            Some(other) => {
+                warn!(
+                    "{} is '{}'; expected SMART or VERBATIM. Using SMART",
+                    MODE_ENV, other
+                );
+                Self::Smart
+            }
+        }
+    }
+
+    fn as_api_value(self) -> &'static str {
+        match self {
+            Self::Verbatim => "VERBATIM",
+            Self::Smart => "SMART",
+        }
+    }
+}
+
+/// Split a vocabulary setting into distinct, non-empty terms, keeping the
+/// order they were written in and dropping anything past the API limit.
+fn parse_vocabulary(raw: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for term in raw.split([',', '\n']).map(str::trim) {
+        if !term.is_empty() && !terms.iter().any(|seen| seen == term) {
+            terms.push(term.to_string());
+        }
+    }
+    if terms.len() > MAX_VOCABULARY_TERMS {
+        warn!(
+            "{} lists {} terms; only the first {} are sent",
+            VOCABULARY_ENV,
+            terms.len(),
+            MAX_VOCABULARY_TERMS
+        );
+        terms.truncate(MAX_VOCABULARY_TERMS);
+    }
+    terms
+}
+
+/// The first frame of a session: model, output modality and transcription
+/// options. `customVocabulary` is left out entirely when there are no terms.
+fn setup_message(mode: TranscriptionMode, vocabulary: &[String]) -> Value {
+    let mut transcription = json!({
+        "languageCodes": LANGUAGE_CODES,
+        "mode": mode.as_api_value(),
+    });
+    if !vocabulary.is_empty() {
+        transcription["customVocabulary"] = json!(vocabulary);
+    }
+    json!({
+        "setup": {
+            "model": MODEL,
+            "generationConfig": { "responseModalities": ["TEXT"] },
+            "inputAudioTranscription": transcription
+        }
+    })
+}
 
 /// Letters that can only belong to a language we did not ask for. Bangla is
 /// Bengali script and English is Latin, so any other alphabet — Devanagari,
@@ -56,26 +147,65 @@ fn is_wanted_script(c: char) -> bool {
         || ('\u{0980}'..='\u{09FF}').contains(&c) // Bengali
 }
 
-/// Whether a finalized transcript plausibly belongs to a language we asked for.
+/// Reduce a finalized transcript to the part that plausibly belongs to a
+/// language we asked for.
 ///
 /// The model transcribes whatever it hears, so the allowlist the API refuses to
 /// enforce is applied here instead. Script is checked first because it is
 /// decisive: probing the live model with Hindi returns Devanagari, and the
 /// detector alone answers `None` for Devanagari (it cannot separate Hindi from
-/// Marathi) which would let the text through. The detector then catches
-/// Latin-script languages it is confident about, e.g. French.
+/// Marathi) which would let the text through. Only the offending words are
+/// removed: one misheard word in another alphabet used to discard the whole
+/// dictation, which looked exactly like the model having heard nothing.
+///
+/// The detector then catches Latin-script languages it is confident about,
+/// e.g. French, and those still drop the text as a whole — there is no
+/// per-word signal to cut along.
 ///
 /// Fails open — only a confident detection of some *other* language rejects the
 /// text, so romanized Bangla and short or ambiguous utterances are never
 /// silently dropped.
-pub fn accepts_transcript(text: &str) -> bool {
-    if text.chars().any(is_foreign_script) {
-        return false;
+pub fn filter_transcript(text: &str) -> String {
+    let kept = strip_foreign_script(text);
+    match crate::audio_toolkit::lang_id::detect_output_language(&kept, &[]) {
+        Some(language) if !ACCEPTED_LANGUAGES.contains(&language.as_str()) => {
+            info!(
+                "Gemini Live transcript dropped: detected language '{}' is neither Bangla nor English",
+                language
+            );
+            String::new()
+        }
+        _ => kept,
     }
-    match crate::audio_toolkit::lang_id::detect_output_language(text, &[]) {
-        Some(language) => ACCEPTED_LANGUAGES.contains(&language.as_str()),
-        None => true,
+}
+
+/// Remove every word containing a letter from an alphabet we did not ask for.
+/// Text without such a letter is returned untouched, so the line breaks and
+/// spacing of a formatted transcript survive.
+fn strip_foreign_script(text: &str) -> String {
+    if !text.chars().any(is_foreign_script) {
+        return text.to_string();
     }
+    let mut removed = 0usize;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .filter(|word| {
+                    let foreign = word.chars().any(is_foreign_script);
+                    removed += usize::from(foreign);
+                    !foreign
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    info!(
+        "Gemini Live transcript: removed {} word(s) in a script that is neither Bengali nor Latin",
+        removed
+    );
+    lines.join("\n")
 }
 
 /// Gemini wants ~100 ms per chunk (1,024-2,048 frames at 16 kHz). The audio
@@ -348,14 +478,14 @@ async fn run_socket(
     // `select!` below holds the read future alive across the write arm's body.
     let (mut write, mut read) = socket.split();
 
-    let setup = json!({
-        "setup": {
-            "model": MODEL,
-            "generationConfig": { "responseModalities": ["TEXT"] },
-            // Bias (not restrict) recognition toward Bangla and English.
-            "inputAudioTranscription": { "languageCodes": LANGUAGE_CODES }
-        }
-    });
+    let mode = TranscriptionMode::parse(std::env::var(MODE_ENV).ok().as_deref());
+    let vocabulary = parse_vocabulary(&std::env::var(VOCABULARY_ENV).unwrap_or_default());
+    debug!(
+        "Gemini Live setup: mode={}, {} custom vocabulary term(s)",
+        mode.as_api_value(),
+        vocabulary.len()
+    );
+    let setup = setup_message(mode, &vocabulary);
     if let Err(e) = write.send(Message::text(setup.to_string())).await {
         let err = anyhow!("Failed to send the Gemini Live setup message: {}", e);
         let _ = ready_tx.send(Err(anyhow!("{}", err)));
@@ -734,41 +864,133 @@ mod tests {
 
     #[test]
     fn transcripts_in_the_wanted_languages_are_kept() {
-        assert!(accepts_transcript(
-            "First sentence about apples and second sentence about oranges."
-        ));
-        assert!(accepts_transcript("আমার নাম লিখা এবং আমি বাংলা বলি।"));
+        let english = "First sentence about apples and second sentence about oranges.";
+        assert_eq!(filter_transcript(english), english);
+        let bangla = "আমার নাম লিখা এবং আমি বাংলা বলি।";
+        assert_eq!(filter_transcript(bangla), bangla);
+        // Code-switching inside one sentence is the normal case, not an error.
+        let mixed = "আমি আজ অফিসে একটা meeting এ যাব, তারপর pull request review করব।";
+        assert_eq!(filter_transcript(mixed), mixed);
     }
 
     #[test]
     fn foreign_scripts_are_rejected() {
         // The exact line the live Hindi probe returned.
-        assert!(
-            !accepts_transcript("मेरा नाम लेखा है और मैं हिंदी बोलती हूं।"),
+        assert_eq!(
+            filter_transcript("मेरा नाम लेखा है और मैं हिंदी बोलती हूं।"),
+            "",
             "Devanagari must be rejected"
         );
-        assert!(!accepts_transcript("இது ஒரு தமிழ் வாக்கியம்"));
-        assert!(!accepts_transcript("这是一个完全用中文写成的句子"));
+        assert_eq!(filter_transcript("இது ஒரு தமிழ் வாக்கியம்"), "");
+        assert_eq!(filter_transcript("这是一个完全用中文写成的句子"), "");
+    }
+
+    #[test]
+    fn one_foreign_word_does_not_cost_the_whole_transcript() {
+        // A single misheard word in another alphabet used to discard the lot.
+        assert_eq!(
+            filter_transcript("Please send the invoice नमस्ते to the client before Friday."),
+            "Please send the invoice to the client before Friday."
+        );
+        assert_eq!(
+            filter_transcript("আমি আজ বাজারে যাব मैं এবং কিছু সবজি কিনব।"),
+            "আমি আজ বাজারে যাব এবং কিছু সবজি কিনব।"
+        );
+    }
+
+    #[test]
+    fn formatting_survives_the_filter() {
+        // SMART mode returns lists and paragraphs; clean text passes untouched.
+        let list = "Shopping list:\n- apples\n- oranges\n\nCall the office tomorrow.";
+        assert_eq!(filter_transcript(list), list);
+        // With a foreign word present, line structure is still kept.
+        assert_eq!(
+            filter_transcript("Shopping list:\n- apples 苹果\n- oranges"),
+            "Shopping list:\n- apples\n- oranges"
+        );
     }
 
     #[test]
     fn detected_foreign_latin_languages_are_rejected() {
-        assert!(!accepts_transcript(
-            "je m'appelle likha et je parle francais tous les jours"
-        ));
+        assert_eq!(
+            filter_transcript("je m'appelle likha et je parle francais tous les jours"),
+            ""
+        );
     }
 
     #[test]
     fn ambiguous_transcripts_fail_open() {
         // Too short for a confident detection, so it is kept rather than
         // silently swallowing a real dictation.
-        assert!(accepts_transcript("ok"));
-        assert!(accepts_transcript(""));
+        assert_eq!(filter_transcript("ok"), "ok");
+        assert_eq!(filter_transcript(""), "");
         // Romanized Bangla is Latin-script and the detector declines it, which
         // must not cost the user their sentence.
-        assert!(accepts_transcript(
-            "amar nam likha hai ebong ami bangla boli"
-        ));
+        let romanized = "amar nam likha hai ebong ami bangla boli";
+        assert_eq!(filter_transcript(romanized), romanized);
+    }
+
+    #[test]
+    fn setup_asks_for_auto_detected_smart_transcription() {
+        let setup = setup_message(TranscriptionMode::Smart, &[]);
+        let transcription = &setup["setup"]["inputAudioTranscription"];
+        // Empty list = automatic detection, the documented multilingual mode.
+        assert_eq!(transcription["languageCodes"], json!([]));
+        assert_eq!(transcription["mode"], "SMART");
+        // No terms configured: the field is absent rather than an empty list.
+        assert!(transcription.get("customVocabulary").is_none());
+        assert_eq!(setup["setup"]["model"], MODEL);
+        assert_eq!(
+            setup["setup"]["generationConfig"]["responseModalities"],
+            json!(["TEXT"])
+        );
+    }
+
+    #[test]
+    fn setup_carries_the_configured_mode_and_vocabulary() {
+        let vocabulary = parse_vocabulary("Tauri, Mohibur Rahman");
+        let setup = setup_message(TranscriptionMode::Verbatim, &vocabulary);
+        let transcription = &setup["setup"]["inputAudioTranscription"];
+        assert_eq!(transcription["mode"], "VERBATIM");
+        assert_eq!(
+            transcription["customVocabulary"],
+            json!(["Tauri", "Mohibur Rahman"])
+        );
+    }
+
+    #[test]
+    fn transcription_mode_defaults_to_smart() {
+        assert_eq!(TranscriptionMode::parse(None), TranscriptionMode::Smart);
+        assert_eq!(TranscriptionMode::parse(Some("")), TranscriptionMode::Smart);
+        assert_eq!(
+            TranscriptionMode::parse(Some(" verbatim ")),
+            TranscriptionMode::Verbatim
+        );
+        assert_eq!(
+            TranscriptionMode::parse(Some("Smart")),
+            TranscriptionMode::Smart
+        );
+        // A typo must not break dictation; it falls back to the default.
+        assert_eq!(
+            TranscriptionMode::parse(Some("verbose")),
+            TranscriptionMode::Smart
+        );
+    }
+
+    #[test]
+    fn vocabulary_is_split_trimmed_and_deduplicated() {
+        assert_eq!(
+            parse_vocabulary(" Tauri , Mohibur Rahman,,Handy\nTauri\n"),
+            vec!["Tauri", "Mohibur Rahman", "Handy"]
+        );
+        assert!(parse_vocabulary("").is_empty());
+        assert!(parse_vocabulary(" , ,\n").is_empty());
+
+        let too_many = (0..MAX_VOCABULARY_TERMS + 5)
+            .map(|i| format!("term{}", i))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(parse_vocabulary(&too_many).len(), MAX_VOCABULARY_TERMS);
     }
 
     /// Full round trip through `GeminiSession` against the live endpoint, using

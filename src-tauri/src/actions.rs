@@ -118,6 +118,27 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
     style == OverlayStyle::Live && is_streaming
 }
 
+/// Which local VAD profile a recording should use.
+///
+/// The Gemini Live backend always gets unfiltered audio. It runs its own
+/// voice-activity detection server-side, with prefix padding and silence
+/// tolerance tuned for that model, so a second local pass only removes audio
+/// it needed: quiet word onsets and endings were cut, and the gaps between
+/// phrases collapsed into fragments that transcribe worse.
+fn select_vad_policy(
+    vad_enabled: bool,
+    gemini_live: bool,
+    model_supports_streaming: bool,
+) -> VadPolicy {
+    if !vad_enabled || gemini_live {
+        VadPolicy::Disabled
+    } else if model_supports_streaming {
+        VadPolicy::Streaming
+    } else {
+        VadPolicy::Offline
+    }
+}
+
 async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because the transcription is empty");
@@ -479,7 +500,8 @@ impl ShortcutAction for TranscribeAction {
         // ponytail: spike. Gemini transcribes server-side, so warming a local
         // engine is wasted work — and with no model downloaded at all it fails
         // the load and emits a `loading_failed` toast on every single keypress.
-        // VAD still preloads below; the streaming policy needs it either way.
+        // VAD still preloads below: the recorder is built around it, even though
+        // the Gemini path records with the VAD bypassed (see `select_vad_policy`).
         if crate::gemini_live::api_key().is_none() {
             tm.initiate_model_load();
         }
@@ -512,18 +534,14 @@ impl ShortcutAction for TranscribeAction {
         // locally selected model can do, so this gate — which drives start_stream,
         // the VAD policy and the overlay form alike — has to reflect the backend
         // that will actually run, not just the local one.
-        let model_supports_streaming = crate::gemini_live::api_key().is_some()
+        let gemini_live = crate::gemini_live::api_key().is_some();
+        let model_supports_streaming = gemini_live
             || selected_model_info
                 .as_ref()
                 .map(|m| m.supports_streaming)
                 .unwrap_or(false);
-        let vad_policy = if !settings.vad_enabled {
-            VadPolicy::Disabled
-        } else if model_supports_streaming {
-            VadPolicy::Streaming
-        } else {
-            VadPolicy::Offline
-        };
+        let vad_policy =
+            select_vad_policy(settings.vad_enabled, gemini_live, model_supports_streaming);
         if model_supports_streaming {
             tm.start_stream();
         }
@@ -969,15 +987,32 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, should_use_streaming_overlay,
-        strip_think_block,
+        complete_unless_cancelled, is_blank_transcription, select_vad_policy,
+        should_use_streaming_overlay, strip_think_block,
     };
+    use crate::audio_toolkit::VadPolicy;
     use crate::settings::OverlayStyle;
     use std::future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn gemini_live_always_records_unfiltered_audio() {
+        // The server does its own voice detection; a local pass in front of it
+        // clipped words, whatever the VAD setting or the local model can do.
+        assert_eq!(select_vad_policy(true, true, true), VadPolicy::Disabled);
+        assert_eq!(select_vad_policy(false, true, true), VadPolicy::Disabled);
+    }
+
+    #[test]
+    fn local_models_keep_their_vad_profiles() {
+        assert_eq!(select_vad_policy(true, false, true), VadPolicy::Streaming);
+        assert_eq!(select_vad_policy(true, false, false), VadPolicy::Offline);
+        assert_eq!(select_vad_policy(false, false, true), VadPolicy::Disabled);
+        assert_eq!(select_vad_policy(false, false, false), VadPolicy::Disabled);
+    }
 
     #[test]
     fn blank_transcription_is_detected() {

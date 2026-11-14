@@ -82,6 +82,10 @@ stops being academic.
 exposes, and it is a **bias, not a filter**. Setting `["bn-BD", "en-US"]` does
 not stop the model transcribing other languages.
 
+The app now sends `[]` (automatic detection). Google documents this value for
+multilingual speech and code-switching, and the hint gave no filtering. See
+[Transcription quality settings](#transcription-quality-settings).
+
 Measured 2026-09-28, one Hindi utterance fed as 16 kHz PCM (`say -v Lekha`):
 
 | `languageCodes` | Transcript |
@@ -96,17 +100,57 @@ is no prompt-side workaround either.
 
 An allowlist therefore has to be enforced client-side.
 [`gemini_live.rs`](../src-tauri/src/gemini_live.rs) does exactly that in
-`accepts_transcript`, which the Gemini finalize path runs before returning text:
-a script check rejects any letter outside Latin or Bengali (Devanagari, Tamil,
-CJK, …), then `whatlang` — via
+`filter_transcript`, which the Gemini finalize path runs before returning text:
+a script check removes each word that has a letter outside Latin or Bengali
+(Devanagari, Tamil, CJK, …), then `whatlang` — via
 [`audio_toolkit/lang_id.rs`](../src-tauri/src/audio_toolkit/lang_id.rs) — rejects
 Latin-script languages it can name confidently, such as French. It fails open,
 so only a confident foreign detection drops the text and romanized Bangla
 survives the detector's `None`.
 
+The script check removes words, not the transcript. Before 2026-11-14 one
+foreign-script word deleted the full dictation, and the result looked the same
+as a model that heard nothing.
+
 The gaps are the parts neither check can see: Assamese shares Bengali script,
 and a Latin-script third language the detector declines (Indonesian probes as
 `None`) passes through.
+
+## Transcription quality settings
+
+Four settings control the quality of the text. None of them needs the paid tier.
+
+| Setting | Value | Where |
+| --- | --- | --- |
+| Local VAD | bypassed on the Gemini path | `select_vad_policy` in [`actions.rs`](../src-tauri/src/actions.rs) |
+| `languageCodes` | `[]` (automatic detection) | `LANGUAGE_CODES` in [`gemini_live.rs`](../src-tauri/src/gemini_live.rs) |
+| `mode` | `SMART`, or `VERBATIM` with `HANDY_GEMINI_MODE` | `.env` |
+| `customVocabulary` | terms from `HANDY_GEMINI_VOCABULARY` | `.env` |
+
+**Local VAD.** Gemini does voice detection on the server, with padding before
+speech and a tolerance for pauses. The local Silero VAD removed audio before the
+server received it. Quiet starts and ends of words were cut, and Google states
+that fragmented audio decreases transcription quality. The Gemini path now
+records with `VadPolicy::Disabled`. The VAD setting has no effect while a Gemini
+key is set.
+
+**Mode and vocabulary.** Measured 2026-11-14 with one 10.5 s English clip
+(`say -v Samantha`). The spoken text was: "Um, so I want to, uh, deploy the Handy
+app with Tauri and Kubernetes on Tuesday. No wait, on Wednesday. Then send the
+invoice to Mohibur Rahman."
+
+| Settings | Transcript |
+| --- | --- |
+| `["bn-BD", "en-US"]`, `VERBATIM` (before) | Um, so I want to uh deploy the handy app with Tori and Kubernetes on Tuesday. No, wait, on Wednesday. Then send the invoice to Mahibur Rahman. |
+| `[]`, `VERBATIM` | Um, so I want to uh deploy the handy app with Tori and Kubernetes on Tuesday. No, wait, on Wednesday. Then send the invoice to Mahibur Rahman. |
+| `[]`, `SMART` | So I want to deploy the Handy app with Tory on Kubernetes on Wednesday. Then send the invoice to Mahibur Rahman. |
+| `[]`, `SMART`, vocabulary (now) | I want to deploy the Handy app with Tauri and Kubernetes on Wednesday. Then send the invoice to Mohibur Rahman. |
+
+The vocabulary was `Tauri, Mohibur Rahman, Handy, Kubernetes`. The time to the
+final text was the same for all four rows (11.0 s to 11.2 s).
+
+The language hint changed nothing on clean synthetic speech in English or in
+Bangla. Its effect on real mixed speech is not measured.
 
 ## Data handling: the real free-vs-paid difference
 
